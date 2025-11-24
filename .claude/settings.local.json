@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/**)",
+      "Bash(timeout /t 3 /nobreak)",
+      "Bash(C:Usersthockswendergithubwhisper.venvScriptspython.exe C:Usersthockswendergithubwhisperdictate.py)",
+      "Bash(.venv/Scripts/python.exe:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
