@@ -12,6 +12,7 @@ import platform
 import sys
 import time
 import pyperclip
+import subprocess
 
 # Fix Windows console encoding for emoji support
 def safe_print(*args, **kwargs):
@@ -45,31 +46,119 @@ else:  # Linux or other
 MODEL_SIZE = "turbo"  # Fastest model with high accuracy 
 
 # INTELLIGENT DEVICE DETECTION
-# 1. Try NVIDIA GPU (CUDA)
+# 1. Try NVIDIA GPU (CUDA) - works on Windows, Linux, and some Macs
+device = "cpu"  # Default fallback
 if torch.cuda.is_available():
     device = "cuda"
-    safe_print(f"✅ Using NVIDIA GPU ({torch.cuda.get_device_name(0)})")
-# 2. Try Apple Silicon GPU (MPS)
-elif torch.backends.mps.is_available():
-    device = "mps"
-    safe_print("✅ Using Apple Silicon GPU (MPS)")
+    safe_print(f"Using NVIDIA GPU ({torch.cuda.get_device_name(0)})")
+# 2. Try Apple Silicon GPU (MPS) - macOS only
+elif SYSTEM == "Darwin":
+    try:
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = "mps"
+            safe_print("Using Apple Silicon GPU (MPS)")
+        else:
+            safe_print("Warning: GPU not found. Using CPU (slower).")
+    except (AttributeError, Exception):
+        safe_print("Warning: GPU not found. Using CPU (slower).")
 # 3. Fallback to CPU
 else:
-    device = "cpu"
-    safe_print("⚠️ GPU not found. Using CPU (slower).")
+    safe_print("Warning: GPU not found. Using CPU (slower).")
 
 safe_print(f"Platform: {SYSTEM}")
-safe_print(f"Loading {MODEL_SIZE} model on {device}...")
+
+# List available audio input devices
+safe_print("\nAvailable audio input devices:")
+try:
+    devices = sd.query_devices()
+    input_devices = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
+    for idx, dev_info in input_devices:
+        default_marker = " (DEFAULT)" if dev_info['name'] == sd.query_devices(kind='input')['name'] else ""
+        safe_print(f"   [{idx}] {dev_info['name']}{default_marker}")
+except Exception as e:
+    safe_print(f"   Could not list devices: {e}")
+
+safe_print(f"\nLoading {MODEL_SIZE} model on {device}...")
 # Time model loading
 startup_start = time.perf_counter()
 model = whisper.load_model(MODEL_SIZE, device=device)
 startup_time = time.perf_counter() - startup_start
 safe_print(f"Model loaded in {startup_time:.2f}s. Hold {HOTKEY_NAME} to dictate.")
+if SYSTEM == "Darwin":
+    safe_print("Note: On macOS, ensure Terminal/Python has Accessibility permissions")
+    safe_print("      (System Settings > Privacy & Security > Accessibility)")
 
 
 
 q = queue.Queue()
 kb_controller = Controller()
+
+def get_frontmost_app_macos():
+    """Get the name of the frontmost application on macOS"""
+    if SYSTEM != "Darwin":
+        return None
+    try:
+        script = '''
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            return frontApp
+        end tell
+        '''
+        result = subprocess.run(['osascript', '-e', script], 
+                              capture_output=True, text=True, timeout=2, check=False)
+        if result.returncode == 0 and result.stdout:
+            return result.stdout.strip()
+        return None
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, Exception):
+        return None
+
+def activate_app_macos(app_name):
+    """Activate a specific application on macOS"""
+    if SYSTEM != "Darwin" or not app_name:
+        return
+    try:
+        # Escape quotes in app name to prevent AppleScript injection
+        escaped_name = app_name.replace('"', '\\"')
+        script = f'''
+        tell application "{escaped_name}"
+            activate
+        end tell
+        '''
+        subprocess.run(['osascript', '-e', script], 
+                      capture_output=True, timeout=2, check=False)
+        time.sleep(0.2)  # Give the app time to activate
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, Exception):
+        pass
+
+def get_frontmost_window_windows():
+    """Get the handle of the frontmost window on Windows"""
+    if SYSTEM != "Windows":
+        return None
+    try:
+        import win32gui
+        hwnd = win32gui.GetForegroundWindow()
+        return hwnd if hwnd else None
+    except ImportError:
+        # pywin32 not installed - this is OK, we'll use fallback
+        return None
+    except Exception:
+        return None
+
+def activate_window_windows(hwnd):
+    """Activate a specific window on Windows"""
+    if SYSTEM != "Windows" or not hwnd:
+        return
+    try:
+        import win32gui
+        import win32con
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.2)  # Give the window time to activate
+    except ImportError:
+        # pywin32 not installed - this is OK
+        pass
+    except Exception:
+        pass
 
 def callback(indata, frames, time, status):
     """This is called (from a separate thread) for each audio block."""
@@ -80,13 +169,34 @@ def callback(indata, frames, time, status):
 def on_press(key):
     if key == HOTKEY:
         # Start recording
-        global recording
+        global recording, previous_window
         if not recording:
             recording = True
-            print("Recording...")
+            # Store the currently focused window before recording (Windows only)
+            # macOS uses simple direct typing, no window switching needed
+            if SYSTEM == "Windows":
+                previous_window = get_frontmost_window_windows()
+            
+            # Clear the queue for a fresh recording
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except:
+                    break
+            safe_print("Recording...")
             global stream
-            stream = sd.InputStream(callback=callback, channels=1, samplerate=16000)
-            stream.start()
+            try:
+                # Explicitly use default input device with float32 dtype
+                stream = sd.InputStream(
+                    callback=callback, 
+                    channels=1, 
+                    samplerate=16000,
+                    dtype='float32'
+                )
+                stream.start()
+            except Exception as e:
+                safe_print(f"Error starting audio stream: {e}")
+                recording = False
 
 def on_release(key):
     global recording, stream
@@ -94,10 +204,13 @@ def on_release(key):
         # Start total processing timer
         total_start = time.perf_counter()
         
-        print("Processing...")
+        safe_print("Processing...")
         recording = False
-        stream.stop()
-        stream.close()
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:
+            safe_print(f"Warning: Error stopping stream: {e}")
 
         # Time audio collection
         collect_start = time.perf_counter()
@@ -113,70 +226,129 @@ def on_release(key):
         process_start = time.perf_counter()
         # Flatten and save to temporary file
         audio_data = np.concatenate(data, axis=0)
-        # Normalize audio
+        # Normalize audio to float32 range [-1.0, 1.0]
         audio_data = audio_data.flatten().astype(np.float32)
+        
+        # Check audio level
+        max_amplitude = np.max(np.abs(audio_data))
+        audio_duration = len(audio_data) / 16000.0
+        safe_print(f"Audio stats: duration={audio_duration:.2f}s, max_amplitude={max_amplitude:.4f}")
+        
+        if max_amplitude < 0.001:
+            safe_print("Warning: Audio level is very low. Check your microphone!")
+        elif max_amplitude > 0.95:
+            safe_print("Warning: Audio may be clipping!")
+        
+        # Normalize to prevent clipping (scale to 0.95 max if needed)
+        if max_amplitude > 0.95:
+            audio_data = audio_data / max_amplitude * 0.95
+        
+        # Convert to int16 for WAV file (Whisper expects int16 format)
+        audio_int16 = (audio_data * 32767).astype(np.int16)
 
-        # Save to temporary WAV file (ffmpeg will handle format conversion)
+        # Save to temporary WAV file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav.write(tmp.name, 16000, audio_data)
+            wav.write(tmp.name, 16000, audio_int16)
             tmp_path = tmp.name
         process_time = time.perf_counter() - process_start
 
         # Time transcription
         transcribe_start = time.perf_counter()
-        result = model.transcribe(tmp_path, fp16=False) # fp16=False for CPU
-        text = result['text'].strip()
+        try:
+            result = model.transcribe(tmp_path, fp16=False, language=None) # fp16=False for CPU, language=None for auto-detect
+            text = result['text'].strip()
+        except Exception as e:
+            safe_print(f"Transcription error: {e}")
+            text = ""
         transcribe_time = time.perf_counter() - transcribe_start
 
         # Delete temp file
-        os.remove(tmp_path)
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
+
+        safe_print(f"Raw transcription result: {repr(text)}")
+        
+        if not text or len(text.strip()) == 0:
+            safe_print("Warning: No text transcribed. Check your microphone and try again.")
+            return
 
         if text:
-            # Time typing/pasting
+            # Time typing
             typing_start = time.perf_counter()
-            # Add a small delay to ensure the application has focus
-            time.sleep(0.1)
             
             # Print what we're about to type (for debugging)
-            print(f"Transcribed: {repr(text)}")  # Using repr to see exact characters
-            print(f"Text length: {len(text)} characters")
+            safe_print(f"Typing: {text}")
             
-            # Use clipboard paste method (cross-platform)
-            # This preserves the original clipboard content
-            original_clipboard = pyperclip.paste()
-            try:
-                # Copy text to clipboard
-                pyperclip.copy(text + " ")
-                # Paste using platform-appropriate modifier key
-                if SYSTEM == "Darwin":  # macOS
-                    kb_controller.press(keyboard.Key.cmd)
-                    kb_controller.press('v')
-                    kb_controller.release('v')
-                    kb_controller.release(keyboard.Key.cmd)
-                else:  # Windows/Linux
-                    kb_controller.press(keyboard.Key.ctrl)
-                    kb_controller.press('v')
-                    kb_controller.release('v')
-                    kb_controller.release(keyboard.Key.ctrl)
-                # Small delay to ensure paste completes
-                time.sleep(0.05)
-                # Restore original clipboard
-                pyperclip.copy(original_clipboard)
-            except Exception as e:
-                print(f"Error pasting text: {e}")
-                # Fallback to direct typing
+            # Fork: macOS and Windows use different approaches
+            # macOS: Simple direct typing (like macos-1.0 that worked)
+            # Windows: Try window switching first, then direct typing
+            typing_success = False
+            
+            if SYSTEM == "Darwin":
+                # macOS: Use simple direct typing approach from macos-1.0
+                # Wait a moment for the app to regain focus after hotkey release
+                time.sleep(0.2)
+                
+                try:
+                    # Simple direct typing - this is what worked in macos-1.0
+                    kb_controller.type(text + " ")
+                    typing_success = True
+                    safe_print("Text typed successfully")
+                except Exception as e:
+                    safe_print(f"Typing failed: {e}")
+                    safe_print("Note: On macOS, ensure Terminal/Python has Accessibility permissions")
+                    safe_print("      (System Settings > Privacy & Security > Accessibility)")
+            
+            elif SYSTEM == "Windows":
+                # Windows: Try to switch back to previous window, then type
+                if previous_window:
+                    try:
+                        import win32gui
+                        current_hwnd = win32gui.GetForegroundWindow()
+                        # Only switch if it's not already the previous window
+                        if current_hwnd != previous_window:
+                            safe_print("Switching back to previous window...")
+                            activate_window_windows(previous_window)
+                            time.sleep(0.2)
+                    except (ImportError, Exception):
+                        # pywin32 not available or failed - continue anyway
+                        safe_print("Note: Click on your target application to receive text")
+                        time.sleep(0.3)
+                else:
+                    safe_print("Note: Click on your target application to receive text")
+                    time.sleep(0.3)
+                
+                try:
+                    # Direct typing on Windows
+                    kb_controller.type(text + " ")
+                    typing_success = True
+                    safe_print("Text typed successfully")
+                except Exception as e:
+                    safe_print(f"Typing failed: {e}")
+                    safe_print("Note: Ensure the application has focus and is not blocked by security software")
+            
+            else:
+                # Linux or other - simple direct typing
+                time.sleep(0.2)
                 try:
                     kb_controller.type(text + " ")
-                except Exception as e2:
-                    print(f"Error typing text: {e2}")
-                    print(f"Text that failed: {repr(text)}")
+                    typing_success = True
+                    safe_print("Text typed successfully")
+                except Exception as e:
+                    safe_print(f"Typing failed: {e}")
+            
+            if not typing_success:
+                safe_print("Warning: Failed to input text. Check application focus and permissions.")
+            
             typing_time = time.perf_counter() - typing_start
             
             # Calculate total time
             total_time = time.perf_counter() - total_start
             
             # Print timing information
-            print(f"\n⏱️  Timing breakdown:")
+            print(f"\nTiming breakdown:")
             print(f"   Audio collection: {collect_time*1000:.1f}ms")
             print(f"   Audio processing: {process_time*1000:.1f}ms")
             print(f"   Transcription:    {transcribe_time:.2f}s")
@@ -184,6 +356,7 @@ def on_release(key):
             print(f"   Total time:        {total_time:.2f}s\n")
 
 recording = False
+previous_window = None  # Windows only - for window switching
 
 # Listen for hotkeys
 with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
