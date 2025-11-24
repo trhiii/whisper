@@ -199,7 +199,7 @@ def on_press(key):
                 recording = False
 
 def on_release(key):
-    global recording, stream
+    global recording, stream, previous_window
     if key == HOTKEY and recording:
         # Start total processing timer
         total_start = time.perf_counter()
@@ -302,32 +302,61 @@ def on_release(key):
                     safe_print("      (System Settings > Privacy & Security > Accessibility)")
             
             elif SYSTEM == "Windows":
-                # Windows: Try to switch back to previous window, then type
+                # Windows: Try multiple methods to ensure text gets to the right place
+                # Method 1: Try to restore focus to previous window
+                window_switched = False
                 if previous_window:
                     try:
                         import win32gui
                         current_hwnd = win32gui.GetForegroundWindow()
                         # Only switch if it's not already the previous window
                         if current_hwnd != previous_window:
-                            safe_print("Switching back to previous window...")
+                            safe_print("Restoring focus to previous window...")
                             activate_window_windows(previous_window)
-                            time.sleep(0.2)
-                    except (ImportError, Exception):
+                            time.sleep(0.3)  # Give more time for window to activate
+                            window_switched = True
+                    except (ImportError, Exception) as e:
                         # pywin32 not available or failed - continue anyway
-                        safe_print("Note: Click on your target application to receive text")
-                        time.sleep(0.3)
-                else:
-                    safe_print("Note: Click on your target application to receive text")
-                    time.sleep(0.3)
+                        pass
                 
+                # Method 2: Try clipboard paste first (more reliable on Windows)
+                # This preserves the original clipboard content
                 try:
-                    # Direct typing on Windows
-                    kb_controller.type(text + " ")
+                    original_clipboard = pyperclip.paste()
+                    # Copy text to clipboard
+                    pyperclip.copy(text + " ")
+                    # Small delay to ensure clipboard is ready
+                    time.sleep(0.1)
+                    
+                    # If we didn't switch windows, give user a moment to click target app
+                    if not window_switched:
+                        safe_print("Paste ready. Ensure target application has focus...")
+                        time.sleep(0.2)
+                    
+                    # Paste using Ctrl+V
+                    kb_controller.press(keyboard.Key.ctrl)
+                    kb_controller.press('v')
+                    kb_controller.release('v')
+                    kb_controller.release(keyboard.Key.ctrl)
+                    # Small delay to ensure paste completes
+                    time.sleep(0.1)
+                    # Restore original clipboard
+                    pyperclip.copy(original_clipboard)
                     typing_success = True
-                    safe_print("Text typed successfully")
+                    safe_print("Text pasted successfully")
                 except Exception as e:
-                    safe_print(f"Typing failed: {e}")
-                    safe_print("Note: Ensure the application has focus and is not blocked by security software")
+                    safe_print(f"Clipboard paste failed: {e}")
+                    # Fallback to direct typing
+                    try:
+                        if not window_switched:
+                            safe_print("Trying direct typing...")
+                            time.sleep(0.2)
+                        kb_controller.type(text + " ")
+                        typing_success = True
+                        safe_print("Text typed successfully")
+                    except Exception as e2:
+                        safe_print(f"Direct typing also failed: {e2}")
+                        safe_print("Note: Ensure the application has focus and is not blocked by security software")
             
             else:
                 # Linux or other - simple direct typing
